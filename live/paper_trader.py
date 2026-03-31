@@ -222,13 +222,17 @@ class TradeLogger:
                 "timestamp", "x_price", "y_price", "alpha", "beta",
                 "spread_synthetic", "variance", "inventory",
                 "reservation_price", "bid", "ask", "as_delta",
+                "cash", "equity",
             ]).to_csv(self.tick_file, index=False)
 
         # Initialize fill log
         if not os.path.exists(self.fill_file):
             pd.DataFrame(columns=[
-                "timestamp", "side", "spread_price", "quantity",
-                "commission", "inventory_after", "pnl_estimate",
+                "timestamp", "side", "spread_price_theoretical", "spread_price_actual",
+                "slippage", "y_fill_price", "x_fill_price",
+                "qty_y", "qty_x", "quantity",
+                "commission", "cash", "inventory_after", "equity",
+                "fill_type",
             ]).to_csv(self.fill_file, index=False)
 
     def log_tick(self, data):
@@ -430,6 +434,7 @@ class PaperTrader:
         )
 
         # Log the tick
+        equity = self.cash + self.inventory * current_spread * CONTRACT_MULTIPLIER
         self.logger.log_tick({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "x_price": x_price,
@@ -443,6 +448,8 @@ class PaperTrader:
             "bid": bid,
             "ask": ask,
             "as_delta": as_delta,
+            "cash": self.cash,
+            "equity": equity,
         })
 
         beta_abs = abs(beta)
@@ -459,7 +466,7 @@ class PaperTrader:
         if bid is not None and current_spread <= bid and self.inventory < MAX_INVENTORY:
             try:
                 # Buy Y
-                self.trading_client.submit_order(
+                order_y = self.trading_client.submit_order(
                     MarketOrderRequest(
                         symbol=TICKER_Y,
                         qty=qty_y,
@@ -468,7 +475,7 @@ class PaperTrader:
                     )
                 )
                 # Sell X
-                self.trading_client.submit_order(
+                order_x = self.trading_client.submit_order(
                     MarketOrderRequest(
                         symbol=TICKER_X,
                         qty=qty_x,
@@ -477,20 +484,47 @@ class PaperTrader:
                     )
                 )
 
-                self.inventory += 1
-                self.cash -= (bid * CONTRACT_MULTIPLIER) + commission
+                # Wait briefly for fills, then fetch actual fill prices
+                time.sleep(2)
+                y_fill_price = y_price  # default
+                x_fill_price = x_price  # default
+                try:
+                    filled_y = self.trading_client.get_order_by_id(order_y.id)
+                    filled_x = self.trading_client.get_order_by_id(order_x.id)
+                    if filled_y.filled_avg_price:
+                        y_fill_price = float(filled_y.filled_avg_price)
+                    if filled_x.filled_avg_price:
+                        x_fill_price = float(filled_x.filled_avg_price)
+                except Exception:
+                    pass
 
-                log.info(f"BUY SPREAD @ {bid:.4f} | inv={self.inventory} | "
-                         f"Y: buy {qty_y} | X: sell {qty_x}")
+                actual_spread_price = y_fill_price - beta_abs * x_fill_price
+                slippage = actual_spread_price - bid
+
+                self.inventory += 1
+                self.cash -= (actual_spread_price * CONTRACT_MULTIPLIER) + commission
+                equity = self.cash + self.inventory * current_spread * CONTRACT_MULTIPLIER
+
+                log.info(f"BUY SPREAD @ theo={bid:.4f} actual={actual_spread_price:.4f} "
+                         f"slip={slippage:.4f} | inv={self.inventory} | "
+                         f"Y: buy {qty_y}@{y_fill_price:.2f} | X: sell {qty_x}@{x_fill_price:.2f}")
 
                 self.logger.log_fill({
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "side": "BUY",
-                    "spread_price": bid,
+                    "spread_price_theoretical": bid,
+                    "spread_price_actual": actual_spread_price,
+                    "slippage": slippage,
+                    "y_fill_price": y_fill_price,
+                    "x_fill_price": x_fill_price,
+                    "qty_y": qty_y,
+                    "qty_x": qty_x,
                     "quantity": 1,
                     "commission": commission,
+                    "cash": self.cash,
                     "inventory_after": self.inventory,
-                    "pnl_estimate": self.cash + self.inventory * current_spread * CONTRACT_MULTIPLIER,
+                    "equity": equity,
+                    "fill_type": "INTRADAY",
                 })
 
             except Exception as e:
@@ -500,7 +534,7 @@ class PaperTrader:
         elif ask is not None and current_spread >= ask and self.inventory > -MAX_INVENTORY:
             try:
                 # Sell Y
-                self.trading_client.submit_order(
+                order_y = self.trading_client.submit_order(
                     MarketOrderRequest(
                         symbol=TICKER_Y,
                         qty=qty_y,
@@ -509,7 +543,7 @@ class PaperTrader:
                     )
                 )
                 # Buy X
-                self.trading_client.submit_order(
+                order_x = self.trading_client.submit_order(
                     MarketOrderRequest(
                         symbol=TICKER_X,
                         qty=qty_x,
@@ -518,20 +552,47 @@ class PaperTrader:
                     )
                 )
 
-                self.inventory -= 1
-                self.cash += (ask * CONTRACT_MULTIPLIER) - commission
+                # Wait briefly for fills, then fetch actual fill prices
+                time.sleep(2)
+                y_fill_price = y_price  # default
+                x_fill_price = x_price  # default
+                try:
+                    filled_y = self.trading_client.get_order_by_id(order_y.id)
+                    filled_x = self.trading_client.get_order_by_id(order_x.id)
+                    if filled_y.filled_avg_price:
+                        y_fill_price = float(filled_y.filled_avg_price)
+                    if filled_x.filled_avg_price:
+                        x_fill_price = float(filled_x.filled_avg_price)
+                except Exception:
+                    pass
 
-                log.info(f"SELL SPREAD @ {ask:.4f} | inv={self.inventory} | "
-                         f"Y: sell {qty_y} | X: buy {qty_x}")
+                actual_spread_price = y_fill_price - beta_abs * x_fill_price
+                slippage = ask - actual_spread_price
+
+                self.inventory -= 1
+                self.cash += (actual_spread_price * CONTRACT_MULTIPLIER) - commission
+                equity = self.cash + self.inventory * current_spread * CONTRACT_MULTIPLIER
+
+                log.info(f"SELL SPREAD @ theo={ask:.4f} actual={actual_spread_price:.4f} "
+                         f"slip={slippage:.4f} | inv={self.inventory} | "
+                         f"Y: sell {qty_y}@{y_fill_price:.2f} | X: buy {qty_x}@{x_fill_price:.2f}")
 
                 self.logger.log_fill({
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "side": "SELL",
-                    "spread_price": ask,
+                    "spread_price_theoretical": ask,
+                    "spread_price_actual": actual_spread_price,
+                    "slippage": slippage,
+                    "y_fill_price": y_fill_price,
+                    "x_fill_price": x_fill_price,
+                    "qty_y": qty_y,
+                    "qty_x": qty_x,
                     "quantity": 1,
                     "commission": commission,
+                    "cash": self.cash,
                     "inventory_after": self.inventory,
-                    "pnl_estimate": self.cash + self.inventory * current_spread * CONTRACT_MULTIPLIER,
+                    "equity": equity,
+                    "fill_type": "INTRADAY",
                 })
 
             except Exception as e:
@@ -557,22 +618,64 @@ class PaperTrader:
         try:
             if self.inventory > 0:
                 # Long spread -> sell Y, buy X to flatten
-                self.trading_client.submit_order(
+                order_y = self.trading_client.submit_order(
                     MarketOrderRequest(symbol=TICKER_Y, qty=qty_y,
                                        side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
-                self.trading_client.submit_order(
+                order_x = self.trading_client.submit_order(
                     MarketOrderRequest(symbol=TICKER_X, qty=qty_x,
                                        side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
             else:
                 # Short spread -> buy Y, sell X to flatten
-                self.trading_client.submit_order(
+                order_y = self.trading_client.submit_order(
                     MarketOrderRequest(symbol=TICKER_Y, qty=qty_y,
                                        side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
-                self.trading_client.submit_order(
+                order_x = self.trading_client.submit_order(
                     MarketOrderRequest(symbol=TICKER_X, qty=qty_x,
                                        side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
 
-            log.info(f"EOD: Flattened {self.inventory} units of spread")
+            # Fetch actual fill prices
+            time.sleep(2)
+            y_fill_price = 0.0
+            x_fill_price = 0.0
+            try:
+                filled_y = self.trading_client.get_order_by_id(order_y.id)
+                filled_x = self.trading_client.get_order_by_id(order_x.id)
+                if filled_y.filled_avg_price:
+                    y_fill_price = float(filled_y.filled_avg_price)
+                if filled_x.filled_avg_price:
+                    x_fill_price = float(filled_x.filled_avg_price)
+            except Exception:
+                pass
+
+            actual_spread_price = y_fill_price - beta_abs * x_fill_price
+            total_shares_flat = qty_y + qty_x
+            flat_commission = total_shares_flat * ALPACA_FEE_PER_SHARE
+
+            if self.inventory > 0:
+                self.cash += (actual_spread_price * CONTRACT_MULTIPLIER * abs(self.inventory)) - flat_commission
+            else:
+                self.cash -= (actual_spread_price * CONTRACT_MULTIPLIER * abs(self.inventory)) + flat_commission
+
+            log.info(f"EOD: Flattened {self.inventory} units @ spread={actual_spread_price:.4f}")
+
+            self.logger.log_fill({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "side": "EOD_FLATTEN",
+                "spread_price_theoretical": 0,
+                "spread_price_actual": actual_spread_price,
+                "slippage": 0,
+                "y_fill_price": y_fill_price,
+                "x_fill_price": x_fill_price,
+                "qty_y": qty_y,
+                "qty_x": qty_x,
+                "quantity": abs(self.inventory),
+                "commission": flat_commission,
+                "cash": self.cash,
+                "inventory_after": 0,
+                "equity": self.cash,
+                "fill_type": "EOD_FLATTEN",
+            })
+
             self.inventory = 0
 
         except Exception as e:
