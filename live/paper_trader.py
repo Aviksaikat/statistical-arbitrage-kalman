@@ -39,7 +39,7 @@ import json
 import logging
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import deque
 
 # ============================================================
@@ -68,8 +68,8 @@ GAMMA = 0.084026
 KAPPA = 0.7284
 
 # Risk limits
-MAX_INVENTORY = 50
-CONTRACT_MULTIPLIER = 100
+MAX_INVENTORY = 10
+CONTRACT_MULTIPLIER = 10
 
 # Costs
 ALPACA_FEE_PER_SHARE = 0.005
@@ -271,7 +271,7 @@ class PaperTrader:
         self.logger = TradeLogger(LOG_DIR)
 
         log.info(f"PaperTrader initialized: {TICKER_X}/{TICKER_Y}")
-        log.info(f"Params: γ={GAMMA:.6f}, κ={KAPPA:.4f}, max_inv={MAX_INVENTORY}")
+        log.info(f"Params: gamma={GAMMA:.6f}, kappa={KAPPA:.4f}, max_inv={MAX_INVENTORY}")
 
     def _load_kalman_params(self):
         """Load Q, R, and last state from NB01 output."""
@@ -289,7 +289,7 @@ class PaperTrader:
                 Q=Q_minute,
                 R=R_daily,
             )
-            log.info(f"Kalman loaded from metadata: α₀={self.kalman.x[0]:.2f}, β₀={self.kalman.x[1]:.4f}")
+            log.info(f"Kalman loaded from metadata: alpha0={self.kalman.x[0]:.2f}, beta0={self.kalman.x[1]:.4f}")
         else:
             # Fallback defaults (from your NB01 run)
             log.warning(f"metadata.json not found at {metadata_path}, using defaults")
@@ -306,14 +306,16 @@ class PaperTrader:
         """Pull last VARIANCE_WINDOW minutes of data to seed the spread history."""
         log.info(f"Warming up: fetching last {VARIANCE_WINDOW + 30} minute bars...")
 
-        end = datetime.utcnow()
+        end = datetime.now(timezone.utc)
         start = end - timedelta(hours=8)  # Enough to cover a full trading day
 
+        from alpaca.data.requests import StockBarsRequest
         request = StockBarsRequest(
             symbol_or_symbols=[TICKER_X, TICKER_Y],
             timeframe=TimeFrame.Minute,
             start=start,
             end=end,
+            feed="iex",
         )
 
         bars = self.data_client.get_stock_bars(request).df.reset_index()
@@ -333,12 +335,12 @@ class PaperTrader:
             self.spread_history.append(spread)
 
         log.info(f"Warmup done: {len(self.spread_history)} bars, "
-                 f"β={self.kalman.x[1]:.4f}, last spread={self.spread_history[-1]:.4f}")
+                 f"beta={self.kalman.x[1]:.4f}, last spread={self.spread_history[-1]:.4f}")
 
     def _get_latest_prices(self):
         """Fetch latest minute bar for both tickers."""
         try:
-            request = StockLatestBarRequest(symbol_or_symbols=[TICKER_X, TICKER_Y])
+            request = StockLatestBarRequest(symbol_or_symbols=[TICKER_X, TICKER_Y], feed="iex")
             bars = self.data_client.get_stock_latest_bar(request)
 
             x_price = bars[TICKER_X].close
@@ -429,7 +431,7 @@ class PaperTrader:
 
         # Log the tick
         self.logger.log_tick({
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "x_price": x_price,
             "y_price": y_price,
             "alpha": self.kalman.x[0],
@@ -482,7 +484,7 @@ class PaperTrader:
                          f"Y: buy {qty_y} | X: sell {qty_x}")
 
                 self.logger.log_fill({
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "side": "BUY",
                     "spread_price": bid,
                     "quantity": 1,
@@ -523,7 +525,7 @@ class PaperTrader:
                          f"Y: sell {qty_y} | X: buy {qty_x}")
 
                 self.logger.log_fill({
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "side": "SELL",
                     "spread_price": ask,
                     "quantity": 1,
@@ -637,7 +639,7 @@ class PaperTrader:
                 self.spread_history.append(spread)
 
                 log.info(f"TICK | X={x_price:.2f} Y={y_price:.2f} | "
-                         f"β={beta:.4f} spread={spread:.4f} | inv={self.inventory}")
+                         f"beta={beta:.4f} spread={spread:.4f} | inv={self.inventory}")
 
                 # Check for execution
                 self._check_and_execute(spread, beta, x_price, y_price)
